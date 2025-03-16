@@ -38,46 +38,70 @@ func ComputeSharedSecret(privateKey, remotePublicKey []byte) ([]byte, error) {
 	return hash[:], nil
 }
 
-func HandshakeInitiator(conn net.Conn) ([]byte, error) {
+func HandshakeInitiator(conn net.Conn, localID string) ([]byte, string, error) {
 	priv, pub, err := GenerateKeyPair()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	pubStr := base64.StdEncoding.EncodeToString(pub)
 	if _, err := fmt.Fprintf(conn, "%s\n", pubStr); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	reader := bufio.NewReader(conn)
 	remotePubStr, err := reader.ReadString('\n')
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	remotePubStr = strings.TrimSpace(remotePubStr)
 	remotePub, err := base64.StdEncoding.DecodeString(remotePubStr)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return ComputeSharedSecret(priv, remotePub)
+	sessionKey, err := ComputeSharedSecret(priv, remotePub)
+	if err != nil {
+		return nil, "", err
+	}
+	if _, err := fmt.Fprintf(conn, "%s\n", localID); err != nil {
+		return nil, "", err
+	}
+	remoteID, err := reader.ReadString('\n')
+	if err != nil {
+		return nil, "", err
+	}
+	remoteID = strings.TrimSpace(remoteID)
+	return sessionKey, remoteID, nil
 }
 
-func HandshakeResponder(conn net.Conn) ([]byte, error) {
+func HandshakeResponder(conn net.Conn, localID string) ([]byte, string, error) {
 	reader := bufio.NewReader(conn)
 	remotePubStr, err := reader.ReadString('\n')
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	remotePubStr = strings.TrimSpace(remotePubStr)
 	remotePub, err := base64.StdEncoding.DecodeString(remotePubStr)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	priv, pub, err := GenerateKeyPair()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	pubStr := base64.StdEncoding.EncodeToString(pub)
 	if _, err := fmt.Fprintf(conn, "%s\n", pubStr); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return ComputeSharedSecret(priv, remotePub)
+	sessionKey, err := ComputeSharedSecret(priv, remotePub)
+	if err != nil {
+		return nil, "", err
+	}
+	remoteID, err := reader.ReadString('\n')
+	if err != nil {
+		return nil, "", err
+	}
+	remoteID = strings.TrimSpace(remoteID)
+	if _, err := fmt.Fprintf(conn, "%s\n", localID); err != nil {
+		return nil, "", err
+	}
+	return sessionKey, remoteID, nil
 }

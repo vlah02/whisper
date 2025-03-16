@@ -15,6 +15,7 @@ import (
 type PeerConnection struct {
 	Conn       net.Conn
 	SessionKey []byte
+	RemoteID   string
 }
 
 type Peer struct {
@@ -49,7 +50,7 @@ func (p *Peer) Listen() error {
 			fmt.Printf("error accepting connection: %v\n", err)
 			continue
 		}
-		sessionKey, err := HandshakeResponder(conn)
+		sessionKey, remoteID, err := HandshakeResponder(conn, p.ID)
 		if err != nil {
 			fmt.Printf("handshake failed with %s: %v\n", conn.RemoteAddr().String(), err)
 			err := conn.Close()
@@ -58,11 +59,20 @@ func (p *Peer) Listen() error {
 			}
 			continue
 		}
-		peerAddr := conn.RemoteAddr().String()
 		p.mu.Lock()
-		p.peers[peerAddr] = &PeerConnection{
+		if _, exists := p.peers[remoteID]; exists {
+			p.mu.Unlock()
+			err := conn.Close()
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Duplicate connection from %s detected; closing.\n", remoteID)
+			continue
+		}
+		p.peers[remoteID] = &PeerConnection{
 			Conn:       conn,
 			SessionKey: sessionKey,
+			RemoteID:   remoteID,
 		}
 		p.mu.Unlock()
 		go p.handleConnection(conn, sessionKey)
@@ -159,7 +169,7 @@ func (p *Peer) Connect(address string) error {
 	if err != nil {
 		return fmt.Errorf("failed to connect to %s: %v", address, err)
 	}
-	sessionKey, err := HandshakeInitiator(conn)
+	sessionKey, remoteID, err := HandshakeInitiator(conn, p.ID)
 	if err != nil {
 		err := conn.Close()
 		if err != nil {
@@ -168,13 +178,23 @@ func (p *Peer) Connect(address string) error {
 		return fmt.Errorf("handshake failed with %s: %v", address, err)
 	}
 	p.mu.Lock()
-	p.peers[address] = &PeerConnection{
+	if _, exists := p.peers[remoteID]; exists {
+		p.mu.Unlock()
+		err := conn.Close()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Duplicate connection to %s detected; closing new connection.\n", remoteID)
+		return nil
+	}
+	p.peers[remoteID] = &PeerConnection{
 		Conn:       conn,
 		SessionKey: sessionKey,
+		RemoteID:   remoteID,
 	}
 	p.mu.Unlock()
 	go p.handleConnection(conn, sessionKey)
-	fmt.Printf("Connected to peer at %s\n", address)
+	fmt.Printf("Connected to peer %s at %s\n", remoteID, address)
 	return nil
 }
 
