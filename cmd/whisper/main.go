@@ -17,7 +17,7 @@ import (
 func main() {
 	crypto.LoadSharedOnionKeys()
 
-	address := "localhost:9001"
+	address := "localhost:9000"
 	peer, err := network.NewPeer(address)
 	if err != nil {
 		log.Fatalf("Failed to create peer: %v", err)
@@ -28,6 +28,8 @@ func main() {
 			log.Fatalf("Error while listening: %v", err)
 		}
 	}()
+
+	peer.StartMulticastDiscovery(address)
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
@@ -40,7 +42,7 @@ func main() {
 
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Println("Welcome to Whisper Chat!")
-	fmt.Println("Use /connect <address> to connect to another peer.")
+	fmt.Println("Use /connect <address> to connect manually (if needed).")
 	fmt.Println("Use /onion <hop1,hop2,...> <message> to send an onion-routed message.")
 	for {
 		fmt.Print("Enter message or command: ")
