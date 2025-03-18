@@ -79,7 +79,8 @@ func main() {
 					fmt.Printf("Failed to build onion message: %v\n", err)
 					continue
 				}
-				peer.BroadcastRaw(onionMsg)
+				firstHop := route[0]
+				peer.SendOnionMessage(onionMsg, firstHop)
 			default:
 				fmt.Println("Unknown command.")
 			}

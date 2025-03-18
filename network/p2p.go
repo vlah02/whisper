@@ -228,3 +228,27 @@ func (p *Peer) BroadcastRaw(raw string) {
 		}
 	}
 }
+
+func (p *Peer) SendOnionMessage(onionMsg, firstHop string) {
+	p.mu.Lock()
+	pc, ok := p.peers[firstHop]
+	p.mu.Unlock()
+	if !ok {
+		fmt.Printf("Not connected to first hop %s, attempting to connect...\n", firstHop)
+		if err := p.Connect(firstHop); err != nil {
+			fmt.Printf("Failed to connect to first hop %s: %v\n", firstHop, err)
+			return
+		}
+		p.mu.Lock()
+		pc, ok = p.peers[firstHop]
+		p.mu.Unlock()
+		if !ok {
+			fmt.Printf("Still not connected to first hop %s\n", firstHop)
+			return
+		}
+	}
+	_, err := fmt.Fprintf(pc.Conn, "%s\n", onionMsg)
+	if err != nil {
+		fmt.Printf("Error sending onion message to %s: %v\n", firstHop, err)
+	}
+}
