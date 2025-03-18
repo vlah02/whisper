@@ -73,8 +73,14 @@ func main() {
 					continue
 				}
 				route := strings.Split(parts[1], ",")
-				finalMessage := strings.Join(parts[2:], " ")
-				onionMsg, err := crypto.BuildOnionMessage(route, finalMessage)
+				finalContent := strings.Join(parts[2:], " ")
+				msg := message.NewMessage(peer.ID, finalContent)
+				serializedMsg, err := msg.Serialize()
+				if err != nil {
+					fmt.Printf("Failed to serialize message: %v\n", err)
+					continue
+				}
+				onionMsg, err := crypto.BuildOnionMessage(route, string(serializedMsg))
 				if err != nil {
 					fmt.Printf("Failed to build onion message: %v\n", err)
 					continue
