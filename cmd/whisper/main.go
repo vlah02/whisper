@@ -27,13 +27,19 @@ func main() {
 	autoDiscChoice = strings.TrimSpace(strings.ToLower(autoDiscChoice))
 	autoDiscovery := autoDiscChoice == "y"
 
-	fmt.Print("Enable auto connect (incoming connections auto-accepted)? (y/n): ")
-	autoConnChoice, err := reader.ReadString('\n')
-	if err != nil {
-		log.Printf("Error reading auto connect option: %v", err)
+	var autoConnect bool
+	if autoDiscovery {
+		fmt.Print("Enable auto connect (incoming connections auto-accepted)? (y/n): ")
+		autoConnChoice, err := reader.ReadString('\n')
+		if err != nil {
+			log.Printf("Error reading auto connect option: %v", err)
+		}
+		autoConnChoice = strings.TrimSpace(strings.ToLower(autoConnChoice))
+		autoConnect = autoConnChoice == "y"
+	} else {
+		autoConnect = false
+		fmt.Println("Auto discovery is disabled, so auto connect is skipped.")
 	}
-	autoConnChoice = strings.TrimSpace(strings.ToLower(autoConnChoice))
-	autoConnect := autoConnChoice == "y"
 
 	address := "localhost:9000"
 	peer, err := network.NewPeer(address, autoConnect)
