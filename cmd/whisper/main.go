@@ -17,7 +17,7 @@ import (
 func main() {
 	crypto.GenerateOnionKeys()
 
-	address := "localhost:9002"
+	address := "localhost:9000"
 	peer, err := network.NewPeer(address)
 	if err != nil {
 		log.Fatalf("Failed to create peer: %v", err)
@@ -29,7 +29,20 @@ func main() {
 		}
 	}()
 
-	peer.StartMulticastDiscovery(address)
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Print("Enable auto discovery? (y/n): ")
+	choice, err := reader.ReadString('\n')
+	if err != nil {
+		log.Printf("Error reading input: %v", err)
+	} else {
+		choice = strings.TrimSpace(strings.ToLower(choice))
+		if choice == "y" {
+			peer.StartMulticastDiscovery(address)
+			fmt.Println("Auto discovery enabled.")
+		} else {
+			fmt.Println("Auto discovery disabled. Use /connect <address> to connect manually.")
+		}
+	}
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
@@ -40,10 +53,10 @@ func main() {
 		os.Exit(0)
 	}()
 
-	reader := bufio.NewReader(os.Stdin)
 	fmt.Println("Welcome to Whisper Chat!")
 	fmt.Println("Use /connect <address> to connect manually (if needed).")
 	fmt.Println("Use /onion <hop1,hop2,...> <message> to send an onion-routed message.")
+
 	for {
 		fmt.Print("Enter message or command: ")
 		text, err := reader.ReadString('\n')
