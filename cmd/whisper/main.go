@@ -17,8 +17,26 @@ import (
 func main() {
 	crypto.GenerateOnionKeys()
 
-	address := "localhost:9001"
-	peer, err := network.NewPeer(address)
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Print("Enable auto discovery? (y/n): ")
+	autoDiscChoice, err := reader.ReadString('\n')
+	if err != nil {
+		log.Printf("Error reading auto discovery option: %v", err)
+	}
+	autoDiscChoice = strings.TrimSpace(strings.ToLower(autoDiscChoice))
+	autoDiscovery := autoDiscChoice == "y"
+
+	fmt.Print("Enable auto connect (incoming connections auto-accepted)? (y/n): ")
+	autoConnChoice, err := reader.ReadString('\n')
+	if err != nil {
+		log.Printf("Error reading auto connect option: %v", err)
+	}
+	autoConnChoice = strings.TrimSpace(strings.ToLower(autoConnChoice))
+	autoConnect := autoConnChoice == "y"
+
+	address := "localhost:9000"
+	peer, err := network.NewPeer(address, autoConnect)
 	if err != nil {
 		log.Fatalf("Failed to create peer: %v", err)
 	}
@@ -29,19 +47,11 @@ func main() {
 		}
 	}()
 
-	reader := bufio.NewReader(os.Stdin)
-	fmt.Print("Enable auto discovery? (y/n): ")
-	choice, err := reader.ReadString('\n')
-	if err != nil {
-		log.Printf("Error reading input: %v", err)
+	if autoDiscovery {
+		peer.StartMulticastDiscovery(address)
+		fmt.Println("Auto discovery enabled.")
 	} else {
-		choice = strings.TrimSpace(strings.ToLower(choice))
-		if choice == "y" {
-			peer.StartMulticastDiscovery(address)
-			fmt.Println("Auto discovery enabled.")
-		} else {
-			fmt.Println("Auto discovery disabled. Use /connect <address> to connect manually.")
-		}
+		fmt.Println("Auto discovery disabled. Use /connect <address> to connect manually.")
 	}
 
 	sigs := make(chan os.Signal, 1)
@@ -54,8 +64,11 @@ func main() {
 	}()
 
 	fmt.Println("Welcome to Whisper Chat!")
-	fmt.Println("Use /connect <address> to connect manually (if needed).")
-	fmt.Println("Use /onion <hop1,hop2,...> <message> to send an onion-routed message.")
+	fmt.Println("Commands:")
+	fmt.Println("  /connect <address> - Connect manually")
+	fmt.Println("  /accept <remoteID> - Accept a pending connection")
+	fmt.Println("  /reject <remoteID> - Reject a pending connection")
+	fmt.Println("  /onion <hop1,hop2,...> <message> - Send an onion-routed message")
 
 	for {
 		fmt.Print("Enter message or command: ")
@@ -77,7 +90,7 @@ func main() {
 					fmt.Println("Usage: /connect <address>")
 					continue
 				}
-				if err := peer.Connect(parts[1]); err != nil {
+				if err := peer.Connect(parts[1], false); err != nil {
 					fmt.Printf("Failed to connect: %v\n", err)
 				}
 			case "/accept":

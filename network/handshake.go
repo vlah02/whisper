@@ -55,7 +55,7 @@ func ComputeSharedSecret(privateKey, remotePublicKey []byte) ([]byte, error) {
 	return hash[:], nil
 }
 
-func HandshakeInitiator(conn net.Conn, localID string) ([]byte, string, error) {
+func HandshakeInitiator(conn net.Conn, localID, connType string) ([]byte, string, error) {
 	priv, pub, err := GenerateKeyPair()
 	if err != nil {
 		return nil, "", err
@@ -80,14 +80,14 @@ func HandshakeInitiator(conn net.Conn, localID string) ([]byte, string, error) {
 		return nil, "", err
 	}
 
-	if _, err := fmt.Fprintf(conn, "%s\n", localID); err != nil {
+	if _, err := fmt.Fprintf(conn, "%s|%s\n", localID, connType); err != nil {
 		return nil, "", err
 	}
-	remoteID, err := reader.ReadString('\n')
+	remoteIDLine, err := reader.ReadString('\n')
 	if err != nil {
 		return nil, "", err
 	}
-	remoteID = strings.TrimSpace(remoteID)
+	remoteID := strings.TrimSpace(remoteIDLine)
 
 	localOnionPubPEM, err := crypto.EncodeRSAPublicKey(crypto.LocalOnionPublicKey)
 	if err != nil {
@@ -116,61 +116,67 @@ func HandshakeInitiator(conn net.Conn, localID string) ([]byte, string, error) {
 	return sessionKey, remoteID, nil
 }
 
-func HandshakeResponder(conn net.Conn, localID string) ([]byte, string, error) {
+func HandshakeResponder(conn net.Conn, localID string) ([]byte, string, string, error) {
 	reader := bufio.NewReader(conn)
 	remotePubStr, err := reader.ReadString('\n')
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	remotePubStr = strings.TrimSpace(remotePubStr)
 	remotePub, err := base64.StdEncoding.DecodeString(remotePubStr)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to decode remote ephemeral key: %v", err)
+		return nil, "", "", fmt.Errorf("failed to decode remote ephemeral key: %v", err)
 	}
 	priv, pub, err := GenerateKeyPair()
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	pubStr := base64.StdEncoding.EncodeToString(pub)
 	if _, err := fmt.Fprintf(conn, "%s\n", pubStr); err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	sessionKey, err := ComputeSharedSecret(priv, remotePub)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
-	remoteID, err := reader.ReadString('\n')
+	remoteIDLine, err := reader.ReadString('\n')
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
-	remoteID = strings.TrimSpace(remoteID)
+	remoteIDLine = strings.TrimSpace(remoteIDLine)
+	fields := strings.Split(remoteIDLine, "|")
+	remoteID := fields[0]
+	connType := "explicit"
+	if len(fields) > 1 {
+		connType = fields[1]
+	}
 	if _, err := fmt.Fprintf(conn, "%s\n", localID); err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 
 	localOnionPubPEM, err := crypto.EncodeRSAPublicKey(crypto.LocalOnionPublicKey)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	if _, err := fmt.Fprintf(conn, "%s\n", localOnionPubPEM); err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	remoteOnionPubPEM, err := ReadPEM(reader)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	fmt.Printf("DEBUG: Received remote onion PEM: %q\n", remoteOnionPubPEM)
 	if remoteOnionPubPEM == "" {
-		return nil, "", fmt.Errorf("received empty onion public key")
+		return nil, "", "", fmt.Errorf("received empty onion public key")
 	}
 	if !strings.HasPrefix(remoteOnionPubPEM, "-----BEGIN PUBLIC KEY-----") {
-		return nil, "", fmt.Errorf("unexpected onion public key format: %s", remoteOnionPubPEM)
+		return nil, "", "", fmt.Errorf("unexpected onion public key format: %s", remoteOnionPubPEM)
 	}
 	remoteOnionPub, err := crypto.ParseRSAPublicKey(remoteOnionPubPEM)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to parse remote onion public key: %v", err)
+		return nil, "", "", fmt.Errorf("failed to parse remote onion public key: %v", err)
 	}
 	crypto.RemoteOnionPublicKeys[remoteID] = remoteOnionPub
 
-	return sessionKey, remoteID, nil
+	return sessionKey, remoteID, connType, nil
 }

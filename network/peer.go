@@ -20,22 +20,28 @@ type PeerConnection struct {
 }
 
 type Peer struct {
-	ID       string
-	Address  string
-	listener net.Listener
-	peers    map[string]*PeerConnection
-	pending  map[string]*PeerConnection
-	mu       sync.Mutex
-	gossip   *GossipManager
+	ID             string
+	Address        string
+	listener       net.Listener
+	peers          map[string]*PeerConnection
+	pending        map[string]*PeerConnection
+	lastDiscovered map[string]time.Time
+	autoAccept     bool
+	mu             sync.Mutex
+	gossip         *GossipManager
+	StartTime      time.Time
 }
 
-func NewPeer(address string) (*Peer, error) {
+func NewPeer(address string, autoConnect bool) (*Peer, error) {
 	return &Peer{
-		ID:      address,
-		Address: address,
-		peers:   make(map[string]*PeerConnection),
-		pending: make(map[string]*PeerConnection),
-		gossip:  NewGossipManager(30 * time.Second),
+		ID:             address,
+		Address:        address,
+		peers:          make(map[string]*PeerConnection),
+		pending:        make(map[string]*PeerConnection),
+		autoAccept:     autoConnect,
+		lastDiscovered: make(map[string]time.Time),
+		gossip:         NewGossipManager(30 * time.Second),
+		StartTime:      time.Now(),
 	}, nil
 }
 
@@ -52,56 +58,44 @@ func (p *Peer) Listen() error {
 			fmt.Printf("error accepting connection: %v\n", err)
 			continue
 		}
-		sessionKey, remoteID, err := HandshakeResponder(conn, p.ID)
+		sessionKey, remoteID, incomingConnType, err := HandshakeResponder(conn, p.ID)
 		if err != nil {
 			fmt.Printf("handshake failed with %s: %v\n", conn.RemoteAddr().String(), err)
 			conn.Close()
 			continue
 		}
 		p.mu.Lock()
-		if _, exists := p.peers[remoteID]; exists {
+		if incomingConnType == "explicit" || !p.autoAccept {
+			if _, exists := p.pending[remoteID]; exists {
+				p.mu.Unlock()
+				conn.Close()
+				fmt.Printf("Duplicate pending connection from %s detected; closing.\n", remoteID)
+				continue
+			}
+			p.pending[remoteID] = &PeerConnection{
+				Conn:       conn,
+				SessionKey: sessionKey,
+				RemoteID:   remoteID,
+			}
 			p.mu.Unlock()
-			conn.Close()
-			fmt.Printf("Duplicate connection from %s detected; closing.\n", remoteID)
-			continue
+			fmt.Printf("Incoming connection from %s is pending acceptance. Use /accept or /reject.\n", remoteID)
+		} else {
+			if _, exists := p.peers[remoteID]; exists {
+				p.mu.Unlock()
+				conn.Close()
+				fmt.Printf("Duplicate connection from %s detected; closing.\n", remoteID)
+				continue
+			}
+			p.peers[remoteID] = &PeerConnection{
+				Conn:       conn,
+				SessionKey: sessionKey,
+				RemoteID:   remoteID,
+			}
+			p.mu.Unlock()
+			go p.handleConnection(remoteID, conn, sessionKey)
+			fmt.Printf("Auto accepted connection from %s\n", remoteID)
 		}
-		p.pending[remoteID] = &PeerConnection{
-			Conn:       conn,
-			SessionKey: sessionKey,
-			RemoteID:   remoteID,
-		}
-		p.mu.Unlock()
-		fmt.Printf("Incoming connection from %s. Use /accept %s to accept or /reject %s to reject.\n", remoteID, remoteID, remoteID)
 	}
-}
-
-func (p *Peer) AcceptConnection(remoteID string) error {
-	p.mu.Lock()
-	pc, ok := p.pending[remoteID]
-	if !ok {
-		p.mu.Unlock()
-		return fmt.Errorf("no pending connection for %s", remoteID)
-	}
-	p.peers[remoteID] = pc
-	delete(p.pending, remoteID)
-	p.mu.Unlock()
-	go p.handleConnection(remoteID, pc.Conn, pc.SessionKey)
-	fmt.Printf("Accepted connection from %s\n", remoteID)
-	return nil
-}
-
-func (p *Peer) RejectConnection(remoteID string) error {
-	p.mu.Lock()
-	pc, ok := p.pending[remoteID]
-	if !ok {
-		p.mu.Unlock()
-		return fmt.Errorf("no pending connection for %s", remoteID)
-	}
-	delete(p.pending, remoteID)
-	p.mu.Unlock()
-	pc.Conn.Close()
-	fmt.Printf("Rejected connection from %s\n", remoteID)
-	return nil
 }
 
 func (p *Peer) handleConnection(remoteID string, conn net.Conn, sessionKey []byte) {
@@ -109,10 +103,7 @@ func (p *Peer) handleConnection(remoteID string, conn net.Conn, sessionKey []byt
 		p.mu.Lock()
 		delete(p.peers, remoteID)
 		p.mu.Unlock()
-		err := conn.Close()
-		if err != nil {
-			return
-		}
+		conn.Close()
 		fmt.Printf("Connection closed: %s\n", remoteID)
 	}()
 
@@ -121,10 +112,19 @@ func (p *Peer) handleConnection(remoteID string, conn net.Conn, sessionKey []byt
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			fmt.Printf("Error reading from connection: %v\n", err)
+			fmt.Printf("Error reading from connection %s: %v\n", remoteID, err)
 			return
 		}
 		line = strings.TrimSpace(line)
+
+		if line == "REJECT" {
+			fmt.Printf("Connection from %s was rejected by remote.\n", remoteID)
+			p.mu.Lock()
+			delete(p.peers, remoteID)
+			p.mu.Unlock()
+			return
+		}
+
 		if strings.HasPrefix(line, "ONION:") {
 			nextHop, innerPayload, isFinal, err := crypto.ProcessOnionMessage(line)
 			if err != nil {
@@ -176,56 +176,148 @@ func (p *Peer) handleConnection(remoteID string, conn net.Conn, sessionKey []byt
 	}
 }
 
-func (p *Peer) Close() {
-	if p.listener != nil {
-		if err := p.listener.Close(); err != nil {
-			return
-		}
-	}
+func (p *Peer) Connect(address string, auto bool) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	for addr, pc := range p.peers {
-		err := pc.Conn.Close()
-		if err != nil {
-			return
-		}
-		delete(p.peers, addr)
+	if _, exists := p.peers[address]; exists {
+		p.mu.Unlock()
+		return nil
 	}
-	fmt.Println("Peer shutdown completed.")
-}
+	if _, exists := p.pending[address]; exists {
+		p.mu.Unlock()
+		return nil
+	}
+	p.mu.Unlock()
 
-func (p *Peer) Connect(address string) error {
 	conn, err := net.Dial("tcp", address)
 	if err != nil {
 		return fmt.Errorf("failed to connect to %s: %v", address, err)
 	}
-	sessionKey, remoteID, err := HandshakeInitiator(conn, p.ID)
+
+	var connType string
+	if auto && p.autoAccept {
+		connType = "auto"
+	} else {
+		connType = "explicit"
+	}
+
+	sessionKey, remoteID, err := HandshakeInitiator(conn, p.ID, connType)
 	if err != nil {
-		err := conn.Close()
-		if err != nil {
-			return err
-		}
+		conn.Close()
 		return fmt.Errorf("handshake failed with %s: %v", address, err)
 	}
-	p.mu.Lock()
-	if _, exists := p.peers[remoteID]; exists {
-		p.mu.Unlock()
-		err := conn.Close()
-		if err != nil {
-			return err
+
+	if connType == "auto" {
+		p.mu.Lock()
+		if _, exists := p.peers[remoteID]; exists {
+			p.mu.Unlock()
+			conn.Close()
+			fmt.Printf("Duplicate connection to %s detected; closing new connection.\n", remoteID)
+			return nil
 		}
-		fmt.Printf("Duplicate connection to %s detected; closing new connection.\n", remoteID)
-		return nil
+		p.peers[remoteID] = &PeerConnection{
+			Conn:       conn,
+			SessionKey: sessionKey,
+			RemoteID:   remoteID,
+		}
+		p.mu.Unlock()
+		go p.handleConnection(remoteID, conn, sessionKey)
+		fmt.Printf("Connected to peer %s at %s\n", remoteID, address)
+	} else {
+		p.mu.Lock()
+		if _, exists := p.pending[remoteID]; exists {
+			p.mu.Unlock()
+			conn.Close()
+			fmt.Printf("Duplicate pending connection to %s detected; closing new connection.\n", remoteID)
+			return nil
+		}
+		p.pending[remoteID] = &PeerConnection{
+			Conn:       conn,
+			SessionKey: sessionKey,
+			RemoteID:   remoteID,
+		}
+		p.mu.Unlock()
+		fmt.Printf("Connection request sent to peer %s at %s. Awaiting acceptance...\n", remoteID, address)
+		go p.waitForAcceptance(remoteID, conn, sessionKey)
 	}
-	p.peers[remoteID] = &PeerConnection{
-		Conn:       conn,
-		SessionKey: sessionKey,
-		RemoteID:   remoteID,
-	}
-	p.mu.Unlock()
-	go p.handleConnection(remoteID, conn, sessionKey)
-	fmt.Printf("Connected to peer %s at %s\n", remoteID, address)
 	return nil
+}
+
+func (p *Peer) waitForAcceptance(remoteID string, conn net.Conn, sessionKey []byte) {
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		fmt.Printf("Error waiting for acceptance from %s: %v\n", remoteID, err)
+		p.mu.Lock()
+		delete(p.pending, remoteID)
+		p.mu.Unlock()
+		conn.Close()
+		return
+	}
+	line = strings.TrimSpace(line)
+	if line == "ACCEPT" {
+		p.mu.Lock()
+		pc, exists := p.pending[remoteID]
+		if exists {
+			delete(p.pending, remoteID)
+			p.peers[remoteID] = pc
+		}
+		p.mu.Unlock()
+		fmt.Printf("Peer %s accepted the connection.\n", remoteID)
+		go p.handleConnection(remoteID, conn, sessionKey)
+	} else {
+		p.mu.Lock()
+		delete(p.pending, remoteID)
+		p.mu.Unlock()
+		fmt.Printf("Peer %s rejected the connection.\n", remoteID)
+		conn.Close()
+	}
+}
+
+func (p *Peer) AcceptConnection(remoteID string) error {
+	p.mu.Lock()
+	pc, ok := p.pending[remoteID]
+	if !ok {
+		p.mu.Unlock()
+		return fmt.Errorf("no pending connection for %s", remoteID)
+	}
+	p.peers[remoteID] = pc
+	delete(p.pending, remoteID)
+	p.mu.Unlock()
+	_, err := fmt.Fprintf(pc.Conn, "ACCEPT\n")
+	if err != nil {
+		return fmt.Errorf("failed to send acceptance message: %v", err)
+	}
+	go p.handleConnection(remoteID, pc.Conn, pc.SessionKey)
+	fmt.Printf("Accepted connection from %s\n", remoteID)
+	return nil
+}
+
+func (p *Peer) RejectConnection(remoteID string) error {
+	p.mu.Lock()
+	pc, ok := p.pending[remoteID]
+	if !ok {
+		p.mu.Unlock()
+		return fmt.Errorf("no pending connection for %s", remoteID)
+	}
+	delete(p.pending, remoteID)
+	p.mu.Unlock()
+	fmt.Fprintf(pc.Conn, "REJECT\n")
+	pc.Conn.Close()
+	fmt.Printf("Rejected connection from %s\n", remoteID)
+	return nil
+}
+
+func (p *Peer) Close() {
+	if p.listener != nil {
+		_ = p.listener.Close()
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for addr, pc := range p.peers {
+		_ = pc.Conn.Close()
+		delete(p.peers, addr)
+	}
+	fmt.Println("Peer shutdown completed.")
 }
 
 func (p *Peer) BroadcastMessage(msg message.Message) {
@@ -271,7 +363,7 @@ func (p *Peer) SendOnionMessage(onionMsg, firstHop string) {
 	p.mu.Unlock()
 	if !ok {
 		fmt.Printf("Not connected to first hop %s, attempting to connect...\n", firstHop)
-		if err := p.Connect(firstHop); err != nil {
+		if err := p.Connect(firstHop, true); err != nil {
 			fmt.Printf("Failed to connect to first hop %s: %v\n", firstHop, err)
 			return
 		}
