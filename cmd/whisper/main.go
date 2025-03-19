@@ -17,7 +17,7 @@ import (
 func main() {
 	crypto.GenerateOnionKeys()
 
-	address := "localhost:9000"
+	address := "localhost:9001"
 	peer, err := network.NewPeer(address)
 	if err != nil {
 		log.Fatalf("Failed to create peer: %v", err)
@@ -79,6 +79,22 @@ func main() {
 				}
 				if err := peer.Connect(parts[1]); err != nil {
 					fmt.Printf("Failed to connect: %v\n", err)
+				}
+			case "/accept":
+				if len(parts) != 2 {
+					fmt.Println("Usage: /accept <remoteID>")
+					continue
+				}
+				if err := peer.AcceptConnection(parts[1]); err != nil {
+					fmt.Printf("Error accepting connection: %v\n", err)
+				}
+			case "/reject":
+				if len(parts) != 2 {
+					fmt.Println("Usage: /reject <remoteID>")
+					continue
+				}
+				if err := peer.RejectConnection(parts[1]); err != nil {
+					fmt.Printf("Error rejecting connection: %v\n", err)
 				}
 			case "/onion":
 				if len(parts) < 3 {
