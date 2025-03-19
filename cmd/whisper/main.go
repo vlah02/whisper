@@ -15,7 +15,7 @@ import (
 )
 
 func main() {
-	crypto.LoadSharedOnionKeys()
+	crypto.GenerateOnionKeys()
 
 	address := "localhost:9002"
 	peer, err := network.NewPeer(address)

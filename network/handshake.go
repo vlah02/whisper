@@ -11,7 +11,24 @@ import (
 	"strings"
 
 	"golang.org/x/crypto/curve25519"
+	"whisper/crypto"
 )
+
+func ReadPEM(reader *bufio.Reader) (string, error) {
+	var lines []string
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return "", err
+		}
+		line = strings.TrimRight(line, "\r\n")
+		lines = append(lines, line)
+		if strings.HasPrefix(line, "-----END") {
+			break
+		}
+	}
+	return strings.Join(lines, "\n"), nil
+}
 
 func GenerateKeyPair() (privateKey, publicKey []byte, err error) {
 	privateKey = make([]byte, 32)
@@ -48,6 +65,7 @@ func HandshakeInitiator(conn net.Conn, localID string) ([]byte, string, error) {
 		return nil, "", err
 	}
 	reader := bufio.NewReader(conn)
+
 	remotePubStr, err := reader.ReadString('\n')
 	if err != nil {
 		return nil, "", err
@@ -55,12 +73,13 @@ func HandshakeInitiator(conn net.Conn, localID string) ([]byte, string, error) {
 	remotePubStr = strings.TrimSpace(remotePubStr)
 	remotePub, err := base64.StdEncoding.DecodeString(remotePubStr)
 	if err != nil {
-		return nil, "", err
+		return nil, "", fmt.Errorf("failed to decode remote ephemeral key: %v", err)
 	}
 	sessionKey, err := ComputeSharedSecret(priv, remotePub)
 	if err != nil {
 		return nil, "", err
 	}
+
 	if _, err := fmt.Fprintf(conn, "%s\n", localID); err != nil {
 		return nil, "", err
 	}
@@ -69,6 +88,31 @@ func HandshakeInitiator(conn net.Conn, localID string) ([]byte, string, error) {
 		return nil, "", err
 	}
 	remoteID = strings.TrimSpace(remoteID)
+
+	localOnionPubPEM, err := crypto.EncodeRSAPublicKey(crypto.LocalOnionPublicKey)
+	if err != nil {
+		return nil, "", err
+	}
+	if _, err := fmt.Fprintf(conn, "%s\n", localOnionPubPEM); err != nil {
+		return nil, "", err
+	}
+	remoteOnionPubPEM, err := ReadPEM(reader)
+	if err != nil {
+		return nil, "", err
+	}
+	fmt.Printf("DEBUG: Received remote onion PEM: %q\n", remoteOnionPubPEM)
+	if remoteOnionPubPEM == "" {
+		return nil, "", fmt.Errorf("received empty onion public key")
+	}
+	if !strings.HasPrefix(remoteOnionPubPEM, "-----BEGIN PUBLIC KEY-----") {
+		return nil, "", fmt.Errorf("unexpected onion public key format: %s", remoteOnionPubPEM)
+	}
+	remoteOnionPub, err := crypto.ParseRSAPublicKey(remoteOnionPubPEM)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to parse remote onion public key: %v", err)
+	}
+	crypto.RemoteOnionPublicKeys[remoteID] = remoteOnionPub
+
 	return sessionKey, remoteID, nil
 }
 
@@ -81,7 +125,7 @@ func HandshakeResponder(conn net.Conn, localID string) ([]byte, string, error) {
 	remotePubStr = strings.TrimSpace(remotePubStr)
 	remotePub, err := base64.StdEncoding.DecodeString(remotePubStr)
 	if err != nil {
-		return nil, "", err
+		return nil, "", fmt.Errorf("failed to decode remote ephemeral key: %v", err)
 	}
 	priv, pub, err := GenerateKeyPair()
 	if err != nil {
@@ -103,5 +147,30 @@ func HandshakeResponder(conn net.Conn, localID string) ([]byte, string, error) {
 	if _, err := fmt.Fprintf(conn, "%s\n", localID); err != nil {
 		return nil, "", err
 	}
+
+	localOnionPubPEM, err := crypto.EncodeRSAPublicKey(crypto.LocalOnionPublicKey)
+	if err != nil {
+		return nil, "", err
+	}
+	if _, err := fmt.Fprintf(conn, "%s\n", localOnionPubPEM); err != nil {
+		return nil, "", err
+	}
+	remoteOnionPubPEM, err := ReadPEM(reader)
+	if err != nil {
+		return nil, "", err
+	}
+	fmt.Printf("DEBUG: Received remote onion PEM: %q\n", remoteOnionPubPEM)
+	if remoteOnionPubPEM == "" {
+		return nil, "", fmt.Errorf("received empty onion public key")
+	}
+	if !strings.HasPrefix(remoteOnionPubPEM, "-----BEGIN PUBLIC KEY-----") {
+		return nil, "", fmt.Errorf("unexpected onion public key format: %s", remoteOnionPubPEM)
+	}
+	remoteOnionPub, err := crypto.ParseRSAPublicKey(remoteOnionPubPEM)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to parse remote onion public key: %v", err)
+	}
+	crypto.RemoteOnionPublicKeys[remoteID] = remoteOnionPub
+
 	return sessionKey, remoteID, nil
 }
