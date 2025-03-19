@@ -17,7 +17,7 @@ import (
 func main() {
 	crypto.LoadSharedOnionKeys()
 
-	address := "localhost:9000"
+	address := "localhost:9002"
 	peer, err := network.NewPeer(address)
 	if err != nil {
 		log.Fatalf("Failed to create peer: %v", err)

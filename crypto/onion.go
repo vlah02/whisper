@@ -7,6 +7,8 @@ import (
 	"encoding/pem"
 	"errors"
 	"log"
+
+	"whisper/crypto/encryption"
 )
 
 const sharedPrivateKeyPEM = `
@@ -90,7 +92,8 @@ func BuildOnionMessage(route []string, finalMessage string) (string, error) {
 			return "", err
 		}
 		pubKey := GetOnionPublicKey(route[i])
-		encryptedLayer, err := HybridEncrypt(layerData, pubKey)
+		var hybrid encryption.Hybrid
+		encryptedLayer, err := hybrid.Encrypt(layerData, pubKey)
 		if err != nil {
 			return "", err
 		}
@@ -107,7 +110,8 @@ func ProcessOnionMessage(encrypted string) (nextHop string, innerPayload string,
 	}
 	encrypted = encrypted[len(prefix):]
 
-	decryptedData, err := HybridDecrypt(encrypted, SharedOnionPrivateKey)
+	var hybrid encryption.Hybrid
+	decryptedData, err := hybrid.Decrypt(encrypted, SharedOnionPrivateKey)
 	if err != nil {
 		return
 	}

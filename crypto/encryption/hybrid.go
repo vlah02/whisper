@@ -1,4 +1,4 @@
-package crypto
+package encryption
 
 import (
 	"crypto/aes"
@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+
 	"io"
 )
 
@@ -16,7 +17,14 @@ type HybridPayload struct {
 	Ciphertext   string `json:"ciphertext"`
 }
 
-func HybridEncrypt(plaintext []byte, pub *rsa.PublicKey) (string, error) {
+type Hybrid struct{}
+
+func (h Hybrid) Encrypt(plaintext []byte, key interface{}) (string, error) {
+	pub, ok := key.(*rsa.PublicKey)
+	if !ok {
+		return "", ErrInvalidKeyType
+	}
+
 	aesKey := make([]byte, 32)
 	if _, err := io.ReadFull(rand.Reader, aesKey); err != nil {
 		return "", err
@@ -50,8 +58,12 @@ func HybridEncrypt(plaintext []byte, pub *rsa.PublicKey) (string, error) {
 	return base64.StdEncoding.EncodeToString(data), nil
 }
 
-func HybridDecrypt(encrypted string, priv *rsa.PrivateKey) ([]byte, error) {
-	data, err := base64.StdEncoding.DecodeString(encrypted)
+func (h Hybrid) Decrypt(ciphertext string, key interface{}) ([]byte, error) {
+	priv, ok := key.(*rsa.PrivateKey)
+	if !ok {
+		return nil, ErrInvalidKeyType
+	}
+	data, err := base64.StdEncoding.DecodeString(ciphertext)
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +75,7 @@ func HybridDecrypt(encrypted string, priv *rsa.PrivateKey) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	ciphertext, err := base64.StdEncoding.DecodeString(payload.Ciphertext)
+	ciphertextBytes, err := base64.StdEncoding.DecodeString(payload.Ciphertext)
 	if err != nil {
 		return nil, err
 	}
@@ -80,13 +92,9 @@ func HybridDecrypt(encrypted string, priv *rsa.PrivateKey) ([]byte, error) {
 		return nil, err
 	}
 	nonceSize := aead.NonceSize()
-	if len(ciphertext) < nonceSize {
-		return nil, err
+	if len(ciphertextBytes) < nonceSize {
+		return nil, ErrCiphertextTooShort
 	}
-	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
-	plaintext, err := aead.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		return nil, err
-	}
-	return plaintext, nil
+	nonce, encryptedData := ciphertextBytes[:nonceSize], ciphertextBytes[nonceSize:]
+	return aead.Open(nil, nonce, encryptedData, nil)
 }

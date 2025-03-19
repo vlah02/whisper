@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"whisper/crypto"
+	"whisper/crypto/encryption"
 	"whisper/message"
 )
 
@@ -75,23 +76,23 @@ func (p *Peer) Listen() error {
 			RemoteID:   remoteID,
 		}
 		p.mu.Unlock()
-		go p.handleConnection(conn, sessionKey)
+		go p.handleConnection(remoteID, conn, sessionKey)
 	}
 }
 
-func (p *Peer) handleConnection(conn net.Conn, sessionKey []byte) {
+func (p *Peer) handleConnection(remoteID string, conn net.Conn, sessionKey []byte) {
 	defer func() {
 		p.mu.Lock()
-		delete(p.peers, conn.RemoteAddr().String())
+		delete(p.peers, remoteID)
 		p.mu.Unlock()
 		err := conn.Close()
 		if err != nil {
 			return
 		}
-		fmt.Printf("Connection closed: %s\n", conn.RemoteAddr().String())
+		fmt.Printf("Connection closed: %s\n", remoteID)
 	}()
 
-	fmt.Printf("New connection from: %s\n", conn.RemoteAddr().String())
+	fmt.Printf("New connection from: %s\n", remoteID)
 	reader := bufio.NewReader(conn)
 	for {
 		line, err := reader.ReadString('\n')
@@ -103,7 +104,7 @@ func (p *Peer) handleConnection(conn net.Conn, sessionKey []byte) {
 		if strings.HasPrefix(line, "ONION:") {
 			nextHop, innerPayload, isFinal, err := crypto.ProcessOnionMessage(line)
 			if err != nil {
-				fmt.Printf("Failed to process onion message from %s: %v\n", conn.RemoteAddr().String(), err)
+				fmt.Printf("Failed to process onion message from %s: %v\n", remoteID, err)
 				continue
 			}
 			if isFinal {
@@ -129,10 +130,16 @@ func (p *Peer) handleConnection(conn net.Conn, sessionKey []byte) {
 				}
 			}
 		} else {
-			msg, err := crypto.DecryptMessage(line, sessionKey)
+			var sym encryption.Symmetric
+			plaintext, err := sym.Decrypt(line, sessionKey)
 			if err != nil {
-				fmt.Printf("Failed to decrypt message from %s: %v\n", conn.RemoteAddr().String(), err)
+				fmt.Printf("Failed to decrypt message from %s: %v\n", remoteID, err)
 				fmt.Printf("Raw message: %s\n", line)
+				continue
+			}
+			msg, err := message.DeserializeMessage(plaintext)
+			if err != nil {
+				fmt.Printf("Failed to deserialize message from %s: %v\n", remoteID, err)
 				continue
 			}
 			if p.gossip.Seen(msg.ID) {
@@ -147,8 +154,7 @@ func (p *Peer) handleConnection(conn net.Conn, sessionKey []byte) {
 
 func (p *Peer) Close() {
 	if p.listener != nil {
-		err := p.listener.Close()
-		if err != nil {
+		if err := p.listener.Close(); err != nil {
 			return
 		}
 	}
@@ -193,7 +199,7 @@ func (p *Peer) Connect(address string) error {
 		RemoteID:   remoteID,
 	}
 	p.mu.Unlock()
-	go p.handleConnection(conn, sessionKey)
+	go p.handleConnection(remoteID, conn, sessionKey)
 	fmt.Printf("Connected to peer %s at %s\n", remoteID, address)
 	return nil
 }
@@ -205,8 +211,14 @@ func (p *Peer) BroadcastMessage(msg message.Message) {
 		return
 	}
 	p.gossip.MarkSeen(msg.ID)
+	var sym encryption.Symmetric
+	serialized, err := msg.Serialize()
+	if err != nil {
+		fmt.Printf("Error serializing message: %v\n", err)
+		return
+	}
 	for addr, pc := range p.peers {
-		encrypted, err := crypto.EncryptMessage(msg, pc.SessionKey)
+		encrypted, err := sym.Encrypt(serialized, pc.SessionKey)
 		if err != nil {
 			fmt.Printf("Error encrypting message for %s: %v\n", addr, err)
 			continue

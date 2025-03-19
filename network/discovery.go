@@ -23,7 +23,12 @@ func (p *Peer) multicastBroadcast(myAddress string) {
 		fmt.Printf("Error dialing multicast address: %v\n", err)
 		return
 	}
-	defer conn.Close()
+	defer func(conn *net.UDPConn) {
+		err := conn.Close()
+		if err != nil {
+			fmt.Printf("Error closing multicast connection: %v\n", err)
+		}
+	}(conn)
 
 	message := discoveryPrefix + myAddress
 	ticker := time.NewTicker(5 * time.Second)
@@ -48,9 +53,17 @@ func (p *Peer) multicastListen(myAddress string) {
 		fmt.Printf("Error listening on multicast UDP: %v\n", err)
 		return
 	}
-	defer conn.Close()
+	defer func(conn *net.UDPConn) {
+		err := conn.Close()
+		if err != nil {
+			fmt.Printf("Error closing multicast connection: %v\n", err)
+		}
+	}(conn)
 
-	conn.SetReadBuffer(1024)
+	err = conn.SetReadBuffer(1024)
+	if err != nil {
+		return
+	}
 	buf := make([]byte, 1024)
 
 	for {
@@ -68,7 +81,12 @@ func (p *Peer) multicastListen(myAddress string) {
 				p.mu.Unlock()
 				if !exists {
 					fmt.Printf("Discovered new peer: %s (from %s)\n", discoveredAddr, src.String())
-					go p.Connect(discoveredAddr)
+					go func() {
+						err := p.Connect(discoveredAddr)
+						if err != nil {
+							fmt.Printf("Error connecting to peer %s: %v\n", discoveredAddr, err)
+						}
+					}()
 				}
 			}
 		}
