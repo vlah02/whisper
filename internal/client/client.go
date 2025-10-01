@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,11 +14,13 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v4"
+	"github.com/vlah02/whisper/internal/crypto"
 	"github.com/vlah02/whisper/internal/proto"
 )
 
 type ClientApp struct {
 	Username string
+	Identity *crypto.Identity
 	ServerWS *websocket.Conn
 
 	peersMu sync.RWMutex
@@ -34,9 +37,22 @@ type ClientApp struct {
 	routePaths map[string][]string
 	knownMu  sync.RWMutex
 	known    map[string]map[string]struct{}
+	
+	peerKeysMu sync.RWMutex
+	peerKeys   map[string]ed25519.PublicKey
+	sessionsMu sync.RWMutex
+	sessions   map[string]*crypto.SessionKey
 }
 
 func NewClient(ctx context.Context, signalingURL, username string) (*ClientApp, error) {
+	identity, err := crypto.NewIdentity(username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate identity: %w", err)
+	}
+	
+	log.Printf("Generated identity for %s", username)
+	log.Printf("Public key fingerprint: %s", identity.GetFingerprint())
+
 	u, err := url.Parse(signalingURL)
 	if err != nil {
 		return nil, err
@@ -45,8 +61,10 @@ func NewClient(ctx context.Context, signalingURL, username string) (*ClientApp, 
 	if err != nil {
 		return nil, err
 	}
+	
 	app := &ClientApp{
 		Username:   username,
+		Identity:   identity,
 		ServerWS:   c,
 		peers:      make(map[string]*Peer),
 		pending:    make(map[string]struct{}),
@@ -54,8 +72,18 @@ func NewClient(ctx context.Context, signalingURL, username string) (*ClientApp, 
 		routes:     make(map[string]string),
 		routePaths: make(map[string][]string),
 		known:      make(map[string]map[string]struct{}),
+		peerKeys:   make(map[string]ed25519.PublicKey),
+		sessions:   make(map[string]*crypto.SessionKey),
 	}
-	reg := proto.Envelope{Type: proto.TypeRegister, At: time.Now(), Payload: proto.RegisterPayload{Username: username}}
+	
+	reg := proto.Envelope{
+		Type: proto.TypeRegister, 
+		At:   time.Now(), 
+		Payload: proto.RegisterPayload{
+			Username:  username,
+			PublicKey: identity.PublicKeyToString(),
+		},
+	}
 	if err := c.WriteJSON(reg); err != nil {
 		return nil, err
 	}
@@ -91,6 +119,18 @@ func (a *ClientApp) readLoop() {
 			_ = json.Unmarshal(b, &p)
 			remote := p.From
 
+			if p.PublicKey != "" {
+				pubKey, err := a.Identity.ParsePublicKeyFromString(p.PublicKey)
+				if err != nil {
+					log.Printf("Invalid public key from %s: %v", remote, err)
+					break
+				}
+				a.peerKeysMu.Lock()
+				a.peerKeys[remote] = pubKey
+				a.peerKeysMu.Unlock()
+				log.Printf("Stored public key for %s", remote)
+			}
+
 			if a.getPeer(remote) != nil {
 				break
 			}
@@ -114,6 +154,24 @@ func (a *ClientApp) readLoop() {
 			}
 			a.pendingMu.Unlock()
 
+		case proto.TypeAccept:
+			var p proto.AcceptPayload
+			b, _ := json.Marshal(env.Payload)
+			_ = json.Unmarshal(b, &p)
+			remote := env.From
+			
+			if p.PublicKey != "" {
+				pubKey, err := a.Identity.ParsePublicKeyFromString(p.PublicKey)
+				if err != nil {
+					log.Printf("Invalid public key from %s in accept: %v", remote, err)
+				} else {
+					a.peerKeysMu.Lock()
+					a.peerKeys[remote] = pubKey
+					a.peerKeysMu.Unlock()
+					log.Printf("Stored public key for %s from accept", remote)
+				}
+			}
+			
 		case proto.TypeOffer:
 			remote := env.From
 			peer, _ := a.ensurePeer(remote)
@@ -192,6 +250,7 @@ func (a *ClientApp) ensurePeer(remote string) (*Peer, bool) {
 			log.Printf("[%s] datachannel open", remote)
 			go func() {
 				time.Sleep(1 * time.Second)
+				a.initiateKeyExchange(remote)
 				a.exchangePeerLists(remote)
 				a.notifyPeersAboutNewConnection(remote)
 			}()
@@ -281,7 +340,7 @@ func (a *ClientApp) Accept(remote string) {
 		log.Printf("create offer: %v", err)
 		return
 	}
-	a.send(proto.Envelope{Type: proto.TypeAccept, To: remote, At: time.Now(), Payload: proto.AcceptDeclinePayload{To: remote}})
+	a.send(proto.Envelope{Type: proto.TypeAccept, To: remote, At: time.Now(), Payload: proto.AcceptPayload{PublicKey: a.Identity.PublicKeyToString()}})
 	a.send(proto.Envelope{Type: proto.TypeOffer, To: remote, At: time.Now(), Payload: proto.SDPPayload{SDP: sdp}})
 }
 
@@ -383,7 +442,16 @@ func (a *ClientApp) buildRoutePath(targetUser, nextHop string) string {
 func (a *ClientApp) SendTo(user, msg string) error {
 	p := a.getPeer(user)
 	if p != nil {
-		return p.Send(msg)
+		a.sessionsMu.RLock()
+		_, hasSession := a.sessions[user]
+		a.sessionsMu.RUnlock()
+		
+		if hasSession {
+			return a.SendSecureMessage(user, msg)
+		} else {
+			log.Printf("Warning: sending unencrypted message to %s (no secure session)", user)
+			return p.Send(msg)
+		}
 	}
 	
 	if a.SendToViaRoute(user, msg) {
@@ -395,7 +463,6 @@ func (a *ClientApp) SendTo(user, msg string) error {
 
 func (a *ClientApp) SendLocalcast(msg string) {
 	now := time.Now().Format("15:04:05")
-	localcastMsg := fmt.Sprintf("%s [LOCALCAST] %s: %s", now, a.Username, msg)
 	
 	a.peersMu.RLock()
 	defer a.peersMu.RUnlock()
@@ -403,8 +470,38 @@ func (a *ClientApp) SendLocalcast(msg string) {
 		if p == nil {
 			continue
 		}
-		if err := p.Send(localcastMsg); err != nil {
-			log.Printf("localcast to %s: %v", name, err)
+		
+		a.sessionsMu.RLock()
+		_, hasSession := a.sessions[name]
+		a.sessionsMu.RUnlock()
+		
+		if hasSession {
+			encryptedMsg, err := a.encryptMessage(name, msg)
+			if err == nil {
+				signature, sigErr := a.Identity.SignMessage([]byte(encryptedMsg))
+				if sigErr == nil {
+					securePayload := proto.SecureMessagePayload{
+						EncryptedContent: []byte(encryptedMsg),
+						Signature:        []byte(signature),
+						MessageID:        fmt.Sprintf("localcast-%d", time.Now().UnixNano()),
+					}
+					
+					data, _ := json.Marshal(securePayload)
+					if err := p.Send("SECURE_LOCALCAST:" + string(data)); err != nil {
+						log.Printf("secure localcast to %s: %v", name, err)
+					}
+					continue
+				}
+			}
+			localcastMsg := fmt.Sprintf("%s [LOCALCAST] %s: %s", now, a.Username, msg)
+			if err := p.Send(localcastMsg); err != nil {
+				log.Printf("localcast to %s: %v", name, err)
+			}
+		} else {
+			localcastMsg := fmt.Sprintf("%s [LOCALCAST] %s: %s", now, a.Username, msg)
+			if err := p.Send(localcastMsg); err != nil {
+				log.Printf("localcast to %s: %v", name, err)
+			}
 		}
 	}
 }
@@ -412,31 +509,91 @@ func (a *ClientApp) SendLocalcast(msg string) {
 func (a *ClientApp) SendBroadcast(msg string) {
 	now := time.Now().Format("15:04:05")
 	
-	broadcastMsg := fmt.Sprintf("%s [BROADCAST] %s: %s", now, a.Username, msg)
 	a.peersMu.RLock()
 	for name, p := range a.peers {
 		if p == nil {
 			continue
 		}
-		if err := p.Send(broadcastMsg); err != nil {
+		
+		a.sessionsMu.RLock()
+		_, hasSession := a.sessions[name]
+		a.sessionsMu.RUnlock()
+		
+		var messageToSend string
+		if hasSession {
+			encryptedMsg, err := a.encryptMessage(name, msg)
+			if err == nil {
+
+				messageToSend = fmt.Sprintf("%s [SECURE-BROADCAST] %s: <encrypted>", now, a.Username)
+				if err := p.Send(messageToSend + "|ENCRYPTED|" + encryptedMsg); err != nil {
+					log.Printf("secure broadcast to %s: %v", name, err)
+				}
+				continue
+			} else {
+			}
+		}
+		
+		messageToSend = fmt.Sprintf("%s [BROADCAST] %s: %s", now, a.Username, msg)
+		if err := p.Send(messageToSend); err != nil {
 			log.Printf("broadcast to %s: %v", name, err)
 		}
 	}
 	a.peersMu.RUnlock()
 	
+	broadcastMsg := fmt.Sprintf("%s [BROADCAST] %s: %s", now, a.Username, msg)
+	
 	a.routesMu.RLock()
 	for user, nextHop := range a.routes {
-		if a.getPeer(user) == nil {
-			payload := proto.RouteMessagePayload{
-				From:     a.Username,
-				To:       user,
-				Content:  fmt.Sprintf("[BROADCAST] %s", msg),
-				HopCount: 0,
+		if a.getPeer(user) != nil {
+			continue
+		}
+		
+		a.peerKeysMu.RLock()
+		_, hasKey := a.peerKeys[user]
+		a.peerKeysMu.RUnlock()
+		
+		var payload proto.RouteMessagePayload
+		
+		a.sessionsMu.RLock()
+		_, hasSession := a.sessions[user]
+		a.sessionsMu.RUnlock()
+		
+		
+		if hasKey && hasSession {
+			encryptedMsg, err := a.encryptMessage(user, msg)
+			if err == nil {
+				secureBroadcastMsg := fmt.Sprintf("%s [SECURE-BROADCAST] %s: <encrypted>", now, a.Username)
+				payload = proto.RouteMessagePayload{
+					OriginalSender: a.Username,
+					TargetUser:     user,
+					Message:        secureBroadcastMsg,
+					EncryptedContent: encryptedMsg,
+					IsEncrypted:    true,
+				}
+			} else {
+				payload = proto.RouteMessagePayload{
+					OriginalSender: a.Username,
+					TargetUser:     user,
+					Message:        broadcastMsg,
+					IsEncrypted:    false,
+				}
 			}
-			
-			b, _ := json.Marshal(payload)
-			if peer := a.getPeer(nextHop); peer != nil {
-				_ = peer.Send("ROUTE_MESSAGE:" + string(b))
+		} else {
+			if !hasKey {
+				a.requestPublicKey(user)
+			}
+			payload = proto.RouteMessagePayload{
+				OriginalSender: a.Username,
+				TargetUser:     user,
+				Message:        broadcastMsg,
+				IsEncrypted:    false,
+			}
+		}
+		
+		data, _ := json.Marshal(payload)
+		if peer := a.getPeer(nextHop); peer != nil {
+			if err := peer.Send("ROUTE_MESSAGE:" + string(data)); err != nil {
+				log.Printf("Failed to send broadcast route to %s via %s: %v", user, nextHop, err)
 			}
 		}
 	}
@@ -503,49 +660,63 @@ func (a *ClientApp) propagateNewPeerToOthersWithPath(newPeer string, excludePeer
 	}
 }
 
-func (a *ClientApp) handleRouteMessage(payload proto.RouteMessagePayload) {
-	if payload.To == a.Username {
-		now := time.Now().Format("15:04:05")
+func (a *ClientApp) handleRouteMessage(payload proto.RouteMessagePayload) {	
+	if payload.TargetUser == a.Username {		
+		if payload.Message == "[PUBLIC_KEY_REQUEST]" {
+			a.handlePublicKeyRequest(payload)
+			return
+		}
+		if payload.Message == "[PUBLIC_KEY_RESPONSE]" {
+			a.handlePublicKeyResponse(payload)
+			return
+		}
 		
-		if strings.HasPrefix(payload.Content, "[BROADCAST]") {
-			content := strings.TrimPrefix(payload.Content, "[BROADCAST] ")
-			fmt.Printf("%s [BROADCAST] %s: %s\n", now, payload.From, content)
+		if payload.IsEncrypted && payload.EncryptedContent != "" {
+			decryptedMsg, err := a.decryptMessage(payload.OriginalSender, payload.EncryptedContent)
+			if err != nil {
+				log.Printf("Failed to decrypt routed message from %s: %v", payload.OriginalSender, err)
+				now := time.Now().Format("15:04:05")
+				if strings.Contains(payload.Message, "[SECURE-BROADCAST]") {
+					fmt.Printf("%s [SECURE-BROADCAST] %s: <decryption failed>\n", now, payload.OriginalSender)
+				} else {
+					fmt.Printf("%s [SECURE-ROUTED] %s: <decryption failed>\n", now, payload.OriginalSender)
+				}
+			} else {
+				now := time.Now().Format("15:04:05")
+				if strings.Contains(payload.Message, "[SECURE-BROADCAST]") {
+					fmt.Printf("%s [SECURE-BROADCAST] %s: %s\n", now, payload.OriginalSender, decryptedMsg)
+				} else {
+					fmt.Printf("%s [SECURE-ROUTED] %s: %s\n", now, payload.OriginalSender, decryptedMsg)
+				}
+			}
 		} else {
-			fmt.Printf("%s [ROUTED] %s: %s\n", now, payload.From, payload.Content)
+			fmt.Printf("%s\n", payload.Message)
 		}
-		return
-	}
-
-	if payload.HopCount >= 5 {
-		log.Printf("dropping message: hop count exceeded")
-		return
-	}
-
-	if directPeer := a.getPeer(payload.To); directPeer != nil {
-		routedMsg := proto.RouteMessagePayload{
-			From:     payload.From,
-			To:       payload.To,
-			Content:  payload.Content,
-			HopCount: payload.HopCount,
+	} else {		
+		if directPeer := a.getPeer(payload.TargetUser); directPeer != nil {
+			data, _ := json.Marshal(payload)
+			if err := directPeer.Send("ROUTE_MESSAGE:" + string(data)); err != nil {
+				log.Printf("Failed to forward route message directly: %v", err)
+			} else {
+			}
+			return
 		}
-		b, _ := json.Marshal(routedMsg)
-		_ = directPeer.Send("ROUTE_MESSAGE:" + string(b))
-		return
-	}
-
-	a.routesMu.RLock()
-	nextHop, exists := a.routes[payload.To]
-	a.routesMu.RUnlock()
-
-	if !exists {
-		log.Printf("no route to %s", payload.To)
-		return
-	}
-
-	payload.HopCount++
-	b, _ := json.Marshal(payload)
-	if peer := a.getPeer(nextHop); peer != nil {
-		_ = peer.Send("ROUTE_MESSAGE:" + string(b))
+		
+		a.routesMu.RLock()
+		nextHop, exists := a.routes[payload.TargetUser]
+		a.routesMu.RUnlock()
+		
+		if exists {
+			if forwardPeer := a.getPeer(nextHop); forwardPeer != nil {
+				data, _ := json.Marshal(payload)
+				if err := forwardPeer.Send("ROUTE_MESSAGE:" + string(data)); err != nil {
+					log.Printf("Failed to forward route message: %v", err)
+				} else {
+				}
+			} else {
+			}
+		} else {
+		}
 	}
 }
 
@@ -553,24 +724,72 @@ func (a *ClientApp) SendToViaRoute(user, msg string) bool {
 	a.routesMu.RLock()
 	nextHop, exists := a.routes[user]
 	a.routesMu.RUnlock()
-
+	
 	if !exists {
 		return false
 	}
-
-	payload := proto.RouteMessagePayload{
-		From:     a.Username,
-		To:       user,
-		Content:  msg,
-		HopCount: 0,
+	
+	peer := a.getPeer(nextHop)
+	if peer == nil {
+		return false
 	}
-
-	b, _ := json.Marshal(payload)
-	if peer := a.getPeer(nextHop); peer != nil {
-		_ = peer.Send("ROUTE_MESSAGE:" + string(b))
+	
+	a.peerKeysMu.RLock()
+	_, hasTargetKey := a.peerKeys[user]
+	a.peerKeysMu.RUnlock()
+	
+	if !hasTargetKey {
+		a.requestPublicKey(user)
+		go func() {
+			time.Sleep(2 * time.Second)
+			a.SendToViaRoute(user, msg)
+		}()
 		return true
 	}
-	return false
+	
+	var routeMsg string
+	now := time.Now().Format("15:04:05")
+	
+	a.sessionsMu.RLock()
+	_, hasTargetSession := a.sessions[user]
+	a.sessionsMu.RUnlock()
+	
+	if hasTargetSession {
+		encryptedMsg, err := a.encryptMessage(user, msg)
+		if err == nil {
+			routeMsg = fmt.Sprintf("%s [SECURE-ROUTED] %s: <encrypted>", now, a.Username)
+			payload := proto.RouteMessagePayload{
+				OriginalSender: a.Username,
+				TargetUser:     user,
+				Message:        routeMsg,
+				EncryptedContent: encryptedMsg,
+				IsEncrypted:     true,
+			}
+			
+			data, err := json.Marshal(payload)
+			if err != nil {
+				return false
+			}
+			
+			return peer.Send("ROUTE_MESSAGE:"+string(data)) == nil
+		}
+	}
+	
+	routeMsg = fmt.Sprintf("%s [ROUTED] %s: %s", now, a.Username, msg)
+	
+	payload := proto.RouteMessagePayload{
+		OriginalSender: a.Username,
+		TargetUser:     user,
+		Message:        routeMsg,
+		IsEncrypted:    false,  
+	}
+	
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return false
+	}
+	
+	return peer.Send("ROUTE_MESSAGE:"+string(data)) == nil
 }
 
 func (a *ClientApp) GetRoutedUsers() map[string]string {
@@ -585,7 +804,31 @@ func (a *ClientApp) GetRoutedUsers() map[string]string {
 }
 
 func (a *ClientApp) handlePeerMessage(from string, message string) {
-	if strings.HasPrefix(message, "NEW_CONNECTION:") {
+	if strings.HasPrefix(message, "KEY_EXCHANGE:") {
+		data := strings.TrimPrefix(message, "KEY_EXCHANGE:")
+		var payload proto.KeyExchangePayload
+		if err := json.Unmarshal([]byte(data), &payload); err != nil {
+			log.Printf("failed to parse key exchange: %v", err)
+			return
+		}
+		a.handleKeyExchange(from, payload)
+	} else if strings.HasPrefix(message, "SECURE_MESSAGE:") {
+		data := strings.TrimPrefix(message, "SECURE_MESSAGE:")
+		var payload proto.SecureMessagePayload
+		if err := json.Unmarshal([]byte(data), &payload); err != nil {
+			log.Printf("failed to parse secure message: %v", err)
+			return
+		}
+		a.handleSecureMessage(from, payload)
+	} else if strings.HasPrefix(message, "SECURE_LOCALCAST:") {
+		data := strings.TrimPrefix(message, "SECURE_LOCALCAST:")
+		var payload proto.SecureMessagePayload
+		if err := json.Unmarshal([]byte(data), &payload); err != nil {
+			log.Printf("failed to parse secure localcast: %v", err)
+			return
+		}
+		a.handleSecureLocalcast(from, payload)
+	} else if strings.HasPrefix(message, "NEW_CONNECTION:") {
 		data := strings.TrimPrefix(message, "NEW_CONNECTION:")
 		var payload proto.NewConnectionPayload
 		if err := json.Unmarshal([]byte(data), &payload); err != nil {
@@ -610,7 +853,23 @@ func (a *ClientApp) handlePeerMessage(from string, message string) {
 		}
 		a.handleRouteMessage(payload)
 	} else {
-		if strings.Contains(message, "[LOCALCAST]") || strings.Contains(message, "[BROADCAST]") {
+		if strings.Contains(message, "[SECURE-BROADCAST]") && strings.Contains(message, "<encrypted>") && strings.Contains(message, "|ENCRYPTED|") {
+			parts := strings.SplitN(message, "|ENCRYPTED|", 2)
+			if len(parts) == 2 {
+				displayMessage := parts[0]
+				encryptedContent := parts[1]
+				
+				decryptedMsg, err := a.decryptMessage(from, encryptedContent)
+				if err == nil {
+					decryptedDisplay := strings.Replace(displayMessage, "<encrypted>", decryptedMsg, 1)
+					fmt.Printf("%s\n", decryptedDisplay)
+				} else {
+					fmt.Printf("%s\n", displayMessage)
+				}
+			} else {
+				fmt.Printf("%s\n", message)
+			}
+		} else if strings.Contains(message, "[LOCALCAST]") || strings.Contains(message, "[BROADCAST]") {
 			fmt.Printf("%s\n", message)
 		} else {
 			now := time.Now().Format("15:04:05")
@@ -668,9 +927,7 @@ func (a *ClientApp) shareReachableUsersViaNewPeer(newPeer string) {
 	if len(usersViaNewPeer) == 0 {
 		return
 	}
-	
-	log.Printf("[DEBUG] %s sharing users reachable via %s: %v", a.Username, newPeer, usersViaNewPeer)
-	
+		
 	a.peersMu.RLock()
 	var peersToNotify []string
 	for peerName := range a.peers {
@@ -781,4 +1038,318 @@ func (a *ClientApp) handlePeerList(from string, payload proto.PeerListPayload) {
 			}
 		}()
 	}
+}
+
+func (a *ClientApp) initiateKeyExchange(peerName string) {
+	a.peerKeysMu.RLock()
+	peerPublicKey, hasKey := a.peerKeys[peerName]
+	a.peerKeysMu.RUnlock()
+	
+	if hasKey {
+	}
+	
+	if !hasKey {
+		log.Printf("No public key for %s, skipping key exchange", peerName)
+		return
+	}
+	
+	sessionKey, err := crypto.NewSessionKey([]byte(a.Identity.PrivateKey), []byte(peerPublicKey))
+	if err != nil {
+		log.Printf("Failed to create session key for %s: %v", peerName, err)
+		return
+	}
+	
+	a.sessionsMu.Lock()
+	a.sessions[peerName] = sessionKey
+	a.sessionsMu.Unlock()
+	
+	keyExchangePayload := proto.KeyExchangePayload{
+		EphemeralPublicKey: a.Identity.PublicKeyToString(),
+	}
+	
+	a.sendToPeer(peerName, proto.Envelope{
+		Type:    proto.TypeKeyExchange,
+		From:    a.Username,
+		To:      peerName,
+		At:      time.Now(),
+		Payload: keyExchangePayload,
+	})
+	
+	log.Printf("Initiated key exchange with %s", peerName)
+}
+
+func (a *ClientApp) handleKeyExchange(from string, payload proto.KeyExchangePayload) {
+	peerPublicKey, err := a.Identity.ParsePublicKeyFromString(payload.EphemeralPublicKey)
+	if err != nil {
+		log.Printf("Invalid public key in key exchange from %s: %v", from, err)
+		return
+	}
+	
+	a.peerKeysMu.Lock()
+	a.peerKeys[from] = peerPublicKey
+	a.peerKeysMu.Unlock()
+	
+	sessionKey, err := crypto.NewSessionKey([]byte(a.Identity.PrivateKey), []byte(peerPublicKey))
+	if err != nil {
+		log.Printf("Failed to create session key from exchange with %s: %v", from, err)
+		return
+	}
+	a.sessionsMu.Lock()
+	a.sessions[from] = sessionKey
+	a.sessionsMu.Unlock()
+	
+	log.Printf("Established secure session with %s", from)
+}
+
+func (a *ClientApp) encryptMessage(peerName string, message string) (string, error) {
+	a.sessionsMu.RLock()
+	sessionKey, exists := a.sessions[peerName]
+	a.sessionsMu.RUnlock()
+	
+	if !exists {
+		return "", fmt.Errorf("no session key for peer %s", peerName)
+	}
+	
+	return sessionKey.Encrypt(message)
+}
+
+func (a *ClientApp) decryptMessage(peerName string, encryptedMessage string) (string, error) {
+	a.sessionsMu.RLock()
+	sessionKey, exists := a.sessions[peerName]
+	a.sessionsMu.RUnlock()
+	
+	if !exists {
+		return "", fmt.Errorf("no session key for peer %s", peerName)
+	}
+	
+	return sessionKey.Decrypt(encryptedMessage)
+}
+
+func (a *ClientApp) handleSecureMessage(from string, payload proto.SecureMessagePayload) {
+	decryptedMessage, err := a.decryptMessage(from, string(payload.EncryptedContent))
+	if err != nil {
+		log.Printf("Failed to decrypt message from %s: %v", from, err)
+		return
+	}
+	
+	if !a.Identity.VerifySignature(string(payload.Signature), payload.EncryptedContent, a.peerKeys[from]) {
+		log.Printf("Invalid signature on message from %s", from)
+		return
+	}
+	
+	now := time.Now().Format("15:04:05")
+	fmt.Printf("%s [SECURE-MESSAGE] %s: %s\n", now, from, decryptedMessage)
+}
+
+func (a *ClientApp) handleSecureLocalcast(from string, payload proto.SecureMessagePayload) {
+	decryptedMessage, err := a.decryptMessage(from, string(payload.EncryptedContent))
+	if err != nil {
+		log.Printf("Failed to decrypt localcast from %s: %v", from, err)
+		return
+	}
+	
+	if !a.Identity.VerifySignature(string(payload.Signature), payload.EncryptedContent, a.peerKeys[from]) {
+		log.Printf("Invalid signature on localcast from %s", from)
+		return
+	}
+	
+	now := time.Now().Format("15:04:05")
+	fmt.Printf("%s [SECURE-LOCALCAST] %s: %s\n", now, from, decryptedMessage)
+}
+
+func (a *ClientApp) requestPublicKey(username string) {
+	
+	a.peerKeysMu.RLock()
+	_, hasKey := a.peerKeys[username]
+	a.peerKeysMu.RUnlock()
+	
+	if hasKey {
+		return
+	}
+	
+	request := proto.PublicKeyRequestPayload{
+		RequestedUser: username,
+		RequesterUser: a.Username,
+	}
+	
+	payload := proto.RouteMessagePayload{
+		OriginalSender: a.Username,
+		TargetUser:     username,
+		Message:        "[PUBLIC_KEY_REQUEST]",
+		IsEncrypted:    false,
+	}
+	
+	requestData, _ := json.Marshal(request)
+	payload.EncryptedContent = string(requestData)
+	
+	a.routesMu.RLock()
+	nextHop, exists := a.routes[username]
+	a.routesMu.RUnlock()
+	
+	if exists {
+		data, _ := json.Marshal(payload)
+		if peer := a.getPeer(nextHop); peer != nil {
+			_ = peer.Send("ROUTE_MESSAGE:" + string(data))
+		}
+	}
+}
+
+func (a *ClientApp) handlePublicKeyRequest(payload proto.RouteMessagePayload) {
+	var request proto.PublicKeyRequestPayload
+	if err := json.Unmarshal([]byte(payload.EncryptedContent), &request); err != nil {
+		log.Printf("Failed to parse public key request: %v", err)
+		return
+	}
+		response := proto.PublicKeyResponsePayload{
+		User:      a.Username,
+		PublicKey: a.Identity.PublicKeyToString(),
+		Requester: request.RequesterUser,
+	}
+	
+	responsePayload := proto.RouteMessagePayload{
+		OriginalSender: a.Username,
+		TargetUser:     request.RequesterUser,
+		Message:        "[PUBLIC_KEY_RESPONSE]",
+		IsEncrypted:    false,
+	}
+	
+	responseData, _ := json.Marshal(response)
+	responsePayload.EncryptedContent = string(responseData)
+	
+	a.routesMu.RLock()
+	nextHop, exists := a.routes[request.RequesterUser]
+	a.routesMu.RUnlock()
+	
+	if exists {
+		data, _ := json.Marshal(responsePayload)
+		if peer := a.getPeer(nextHop); peer != nil {
+			_ = peer.Send("ROUTE_MESSAGE:" + string(data))
+		}
+	}
+	
+	a.requestPublicKey(request.RequesterUser)
+}
+
+func (a *ClientApp) handlePublicKeyResponse(payload proto.RouteMessagePayload) {
+	var response proto.PublicKeyResponsePayload
+	if err := json.Unmarshal([]byte(payload.EncryptedContent), &response); err != nil {
+		log.Printf("Failed to parse public key response: %v", err)
+		return
+	}
+	
+	pubKey, err := a.Identity.ParsePublicKeyFromString(response.PublicKey)
+	if err != nil {
+		log.Printf("Invalid public key in response from %s: %v", response.User, err)
+		return
+	}
+	
+	a.peerKeysMu.Lock()
+	a.peerKeys[response.User] = pubKey
+	a.peerKeysMu.Unlock()
+	
+	sessionKey, err := crypto.NewSessionKey([]byte(a.Identity.PrivateKey), []byte(pubKey))
+	if err != nil {
+		log.Printf("Failed to create session key for %s: %v", response.User, err)
+		return
+	}
+	
+	a.sessionsMu.Lock()
+	a.sessions[response.User] = sessionKey
+	a.sessionsMu.Unlock()
+	
+	log.Printf("Established secure session with %s via public key exchange", response.User)
+}
+
+func (a *ClientApp) sendToPeer(peerName string, envelope proto.Envelope) error {
+	peer := a.getPeer(peerName)
+	if peer == nil {
+		return fmt.Errorf("no connection to peer %s", peerName)
+	}
+	
+	var message string
+	switch envelope.Type {
+	case proto.TypeKeyExchange:
+		data, err := json.Marshal(envelope.Payload)
+		if err != nil {
+			return fmt.Errorf("failed to marshal key exchange: %w", err)
+		}
+		message = "KEY_EXCHANGE:" + string(data)
+	case proto.TypeSecureMessage:
+		data, err := json.Marshal(envelope.Payload)
+		if err != nil {
+			return fmt.Errorf("failed to marshal secure message: %w", err)
+		}
+		message = "SECURE_MESSAGE:" + string(data)
+	default:
+		return fmt.Errorf("unsupported message type for sendToPeer: %s", envelope.Type)
+	}
+	
+	return peer.Send(message)
+}
+
+func (a *ClientApp) SendSecureMessage(peerName string, message string) error {
+	a.sessionsMu.RLock()
+	_, hasSession := a.sessions[peerName]
+	a.sessionsMu.RUnlock()
+	
+	if !hasSession {
+		return fmt.Errorf("no secure session with %s", peerName)
+	}
+	
+	encryptedMessage, err := a.encryptMessage(peerName, message)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt message: %w", err)
+	}
+	
+	signature, err := a.Identity.SignMessage([]byte(encryptedMessage))
+	if err != nil {
+		return fmt.Errorf("failed to sign message: %w", err)
+	}
+	
+	securePayload := proto.SecureMessagePayload{
+		EncryptedContent: []byte(encryptedMessage),
+		Signature:        []byte(signature),
+		MessageID:        fmt.Sprintf("%d", time.Now().UnixNano()),
+	}
+	
+	envelope := proto.Envelope{
+		Type:    proto.TypeSecureMessage,
+		From:    a.Username,
+		To:      peerName,
+		At:      time.Now(),
+		Payload: securePayload,
+	}
+	
+	return a.sendToPeer(peerName, envelope)
+}
+
+func (a *ClientApp) ShowSecurityStatus() {
+	fmt.Printf("\n=== Security Status ===\n")
+	fmt.Printf("Your identity: %s\n", a.Username)
+	fmt.Printf("Your public key fingerprint: %s\n", a.Identity.GetFingerprint())
+	
+	fmt.Printf("\nPeer public keys:\n")
+	a.peerKeysMu.RLock()
+	if len(a.peerKeys) == 0 {
+		fmt.Printf("  (none)\n")
+	} else {
+		for peerName, pubKey := range a.peerKeys {
+			fingerprint := a.Identity.GetFingerprintFromPublicKey(pubKey)
+			fmt.Printf("  %s: %s\n", peerName, fingerprint)
+		}
+	}
+	a.peerKeysMu.RUnlock()
+	
+	fmt.Printf("\nSecure sessions:\n")
+	a.sessionsMu.RLock()
+	if len(a.sessions) == 0 {
+		fmt.Printf("  (none)\n")
+	} else {
+		for peerName := range a.sessions {
+			fmt.Printf("  %s: ✓ Active\n", peerName)
+		}
+	}
+	a.sessionsMu.RUnlock()
+	
+	fmt.Printf("=======================\n\n")
 }

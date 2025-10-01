@@ -17,6 +17,8 @@ const (
 	TypeWhoResult        = "who_result"
 	TypeNewConnection    = "new_connection"
 	TypePeerList         = "peer_list"
+	TypeKeyExchange      = "key_exchange"
+	TypeSecureMessage    = "secure_message"
 	TypeRouteMessage     = "route_message"
 	TypeError            = "error"
 )
@@ -31,7 +33,8 @@ type Envelope struct {
 }
 
 type RegisterPayload struct {
-	Username string `json:"username"`
+	Username  string `json:"username"`
+	PublicKey string `json:"publicKey"`
 }
 
 type RegisterAckPayload struct {
@@ -43,8 +46,13 @@ type ConnectPayload struct {
 	To string `json:"to"`
 }
 
+type AcceptPayload struct {
+	PublicKey string `json:"public_key"`
+}
+
 type IncomingPayload struct {
-	From string `json:"from"`
+	From      string `json:"from"`
+	PublicKey string `json:"publicKey"`
 }
 
 type AcceptDeclinePayload struct {
@@ -83,8 +91,30 @@ type PeerInfo struct {
 }
 
 type RouteMessagePayload struct {
-	From     string `json:"from"`
-	To       string `json:"to"`
-	Content  string `json:"content"`
-	HopCount int    `json:"hopCount"`
+	OriginalSender   string `json:"originalSender"`
+	TargetUser       string `json:"targetUser"`
+	Message          string `json:"message"`
+	EncryptedContent string `json:"encryptedContent,omitempty"`
+	IsEncrypted      bool   `json:"isEncrypted"`
+}
+
+type KeyExchangePayload struct {
+	EphemeralPublicKey string `json:"ephemeralPublicKey"`
+}
+
+type SecureMessagePayload struct {
+	EncryptedContent []byte `json:"encryptedContent"`
+	Signature        []byte `json:"signature"`
+	MessageID        string `json:"messageId"`
+}
+
+type PublicKeyRequestPayload struct {
+	RequestedUser string `json:"requestedUser"`
+	RequesterUser string `json:"requesterUser"`
+}
+
+type PublicKeyResponsePayload struct {
+	User      string `json:"user"`
+	PublicKey string `json:"publicKey"`
+	Requester string `json:"requester"`
 }

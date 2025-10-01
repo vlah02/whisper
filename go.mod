@@ -5,6 +5,7 @@ go 1.22.0
 require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/pion/webrtc/v4 v4.1.4
+	golang.org/x/crypto v0.33.0
 )
 
 require (

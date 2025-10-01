@@ -12,9 +12,10 @@ import (
 )
 
 type Client struct {
-	Username string
-	Conn     *websocket.Conn
-	SendQ    chan proto.Envelope
+	Username  string
+	PublicKey string
+	Conn      *websocket.Conn
+	SendQ     chan proto.Envelope
 }
 
 type Hub struct {
@@ -69,11 +70,16 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 				client.SendQ <- errEnv("username required")
 				continue
 			}
+			if p.PublicKey == "" {
+				client.SendQ <- errEnv("public key required")
+				continue
+			}
 			if !h.login(p.Username, client) {
 				client.SendQ <- proto.Envelope{Type: proto.TypeRegisterAck, At: time.Now(), Payload: proto.RegisterAckPayload{OK: false, Reason: "username taken"}}
 				continue
 			}
 			client.Username = p.Username
+			client.PublicKey = p.PublicKey
 			client.SendQ <- proto.Envelope{Type: proto.TypeRegisterAck, At: time.Now(), Payload: proto.RegisterAckPayload{OK: true}}
 
 		case proto.TypeConnect:
@@ -91,10 +97,20 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 				Type:    proto.TypeIncoming,
 				From:    client.Username,
 				At:      time.Now(),
-				Payload: proto.IncomingPayload{From: client.Username},
+				Payload: proto.IncomingPayload{From: client.Username, PublicKey: client.PublicKey},
 			})
 
-		case proto.TypeAccept, proto.TypeDecline, proto.TypeOffer, proto.TypeAnswer, proto.TypeICE, proto.TypeDrop:
+		case proto.TypeAccept:
+			if client.Username == "" {
+				continue
+			}
+			to := env.To
+			if to != "" {
+				env.From = client.Username
+				env.Payload = proto.AcceptPayload{PublicKey: client.PublicKey}
+				h.sendTo(to, env)
+			}
+		case proto.TypeDecline, proto.TypeOffer, proto.TypeAnswer, proto.TypeICE, proto.TypeDrop:
 			if client.Username == "" {
 				continue
 			}

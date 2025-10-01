@@ -12,7 +12,7 @@ import (
 
 func RunCLI(app *client.ClientApp) {
 	in := bufio.NewReader(os.Stdin)
-	fmt.Println("Commands: /connect [user], /accept [user], /decline [user], /who, /drop [user], /msg [user] [message], /localcast [message], /broadcast [message], /quit")
+	fmt.Println("Commands: /connect [user], /accept [user], /decline [user], /who, /drop [user], /msg [user] [message], /localcast [message], /broadcast [message], /security, /quit")
 	for {
 		line, err := in.ReadString('\n')
 		if err != nil {
@@ -85,6 +85,8 @@ func RunCLI(app *client.ClientApp) {
 					msg := strings.Join(parts[1:], " ")
 					app.SendBroadcast(msg)
 				}
+			case "/security":
+				app.ShowSecurityStatus()
 			case "/quit":
 				fmt.Println("bye")
 				return
